@@ -98,6 +98,22 @@ main{max-width:800px;margin:0 auto;padding:16px 16px 100px}
   .grid-header,.grid-row{grid-template-columns:1fr 65px 65px;gap:4px;padding:10px 12px}
   .shop-tab{font-size:12px;padding:10px 6px}
 }
+
+/* ── Schermata PIN ── */
+.pin-screen{position:fixed;inset:0;background:linear-gradient(135deg,var(--dark),var(--dark2));display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;padding:20px}
+.pin-screen h1{font-family:'Playfair Display',serif;color:#fff;font-size:32px;margin-bottom:8px}
+.pin-screen .pin-sub{color:rgba(255,255,255,.7);font-size:14px;margin-bottom:32px;text-align:center}
+.pin-display{display:flex;gap:14px;margin-bottom:32px}
+.pin-dot{width:18px;height:18px;border-radius:50%;border:2px solid rgba(255,255,255,.35);background:transparent;transition:.2s}
+.pin-dot.filled{background:var(--brown);border-color:var(--brown);transform:scale(1.1)}
+.pin-screen.error .pin-dot{border-color:var(--red);animation:shake .4s}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+.pin-pad{display:grid;grid-template-columns:repeat(3,72px);gap:14px}
+.pin-key{width:72px;height:72px;border-radius:50%;border:none;background:rgba(255,255,255,.1);color:#fff;font-size:26px;font-weight:600;cursor:pointer;transition:.15s;-webkit-tap-highlight-color:transparent}
+.pin-key:active{background:rgba(255,255,255,.25);transform:scale(.95)}
+.pin-key.del{background:transparent;font-size:20px}
+.pin-key.empty{background:transparent;cursor:default;pointer-events:none}
+.pin-msg{color:var(--red);font-size:13px;margin-top:18px;min-height:18px;font-weight:600}
 </style>
 </head>
 <body>
@@ -107,6 +123,7 @@ main{max-width:800px;margin:0 auto;padding:16px 16px 100px}
 <!-- ═══════════════════════════════════════════════ -->
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
 
 <div id="app"></div>
 
@@ -119,6 +136,10 @@ const FIREBASE_CONFIG = {
   databaseURL: "https://gelamagazzino-6de61-default-rtdb.europe-west1.firebasedatabase.app",
   projectId: "gelamagazzino-6de61"
 };
+// ═══════════════════════════════════════════════
+// 🔐 PIN DI ACCESSO — MODIFICA QUI PER CAMBIARLO
+// ═══════════════════════════════════════════════
+const APP_PIN = "0708";
 // ═══════════════════════════════════════════════
 
 const DAYS = ["Domenica","Lunedì","Martedì","Mercoledì","Giovedì","Venerdì","Sabato"];
@@ -294,6 +315,26 @@ function initFirebase() {
     db = firebase.database();
     connected = true;
 
+    // Autenticazione anonima — necessaria per le regole di sicurezza
+    firebase.auth().signInAnonymously().catch(err => {
+      console.error("Errore autenticazione:", err);
+    });
+
+    // Aspetta che l'autenticazione sia attiva prima di leggere i dati
+    firebase.auth().onAuthStateChanged(user => {
+      if (!user) return;
+      attachDbListeners();
+    });
+
+  } catch(e) {
+    console.error("Firebase error:", e);
+    loadFromLocal();
+    render();
+  }
+}
+
+function attachDbListeners() {
+  try {
     // Listen for config
     db.ref('config').on('value', snap => {
       const d = snap.val();
@@ -334,7 +375,7 @@ function initFirebase() {
     });
 
   } catch(e) {
-    console.error("Firebase error:", e);
+    console.error("Firebase listeners error:", e);
     loadFromLocal();
     render();
   }
@@ -982,9 +1023,99 @@ function delProduct(id) { if (!confirm('Eliminare questo prodotto?')) return; st
 function delSupplier(id) { if (!confirm('Eliminare questo fornitore e tutti i suoi prodotti?')) return; state.suppliers = state.suppliers.filter(s => s.id !== id); state.products = state.products.filter(p => p.sid !== id); saveConfig(); render(); }
 function delShop(id) { if (state.shops.length <= 1) return; if (!confirm('Eliminare questo negozio?')) return; state.shops = state.shops.filter(s => s.id !== id); saveConfig(); render(); }
 
+// ── Schermata PIN ──
+function showPinScreen() {
+  let entered = "";
+  const screen = document.createElement('div');
+  screen.className = 'pin-screen';
+  screen.innerHTML = `
+    <h1>GelaMagazzino</h1>
+    <div class="pin-sub">Inserisci il PIN per accedere</div>
+    <div class="pin-display">
+      <div class="pin-dot"></div>
+      <div class="pin-dot"></div>
+      <div class="pin-dot"></div>
+      <div class="pin-dot"></div>
+    </div>
+    <div class="pin-pad">
+      <button class="pin-key" data-k="1">1</button>
+      <button class="pin-key" data-k="2">2</button>
+      <button class="pin-key" data-k="3">3</button>
+      <button class="pin-key" data-k="4">4</button>
+      <button class="pin-key" data-k="5">5</button>
+      <button class="pin-key" data-k="6">6</button>
+      <button class="pin-key" data-k="7">7</button>
+      <button class="pin-key" data-k="8">8</button>
+      <button class="pin-key" data-k="9">9</button>
+      <button class="pin-key empty"></button>
+      <button class="pin-key" data-k="0">0</button>
+      <button class="pin-key del" data-k="del">⌫</button>
+    </div>
+    <div class="pin-msg"></div>
+  `;
+  document.body.appendChild(screen);
+
+  const dots = screen.querySelectorAll('.pin-dot');
+  const msg = screen.querySelector('.pin-msg');
+
+  function updateDots() {
+    dots.forEach((d, i) => {
+      d.classList.toggle('filled', i < entered.length);
+    });
+  }
+
+  function tryUnlock() {
+    if (entered === APP_PIN) {
+      try { localStorage.setItem('gm_pin_ok', '1'); } catch(e) {}
+      screen.style.transition = 'opacity .3s';
+      screen.style.opacity = '0';
+      setTimeout(() => {
+        screen.remove();
+        startApp();
+      }, 300);
+    } else {
+      screen.classList.add('error');
+      msg.textContent = 'PIN errato';
+      setTimeout(() => {
+        entered = "";
+        updateDots();
+        screen.classList.remove('error');
+        msg.textContent = '';
+      }, 600);
+    }
+  }
+
+  screen.querySelectorAll('.pin-key').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const k = btn.dataset.k;
+      if (!k) return;
+      if (k === 'del') {
+        entered = entered.slice(0, -1);
+        updateDots();
+      } else if (entered.length < 4) {
+        entered += k;
+        updateDots();
+        if (entered.length === 4) {
+          setTimeout(tryUnlock, 150);
+        }
+      }
+    });
+  });
+}
+
+function startApp() {
+  initFirebase();
+  if (!state.mode) render();
+}
+
 // ── Init ──
-initFirebase();
-if (!state.mode) render();
+let pinOk = false;
+try { pinOk = localStorage.getItem('gm_pin_ok') === '1'; } catch(e) {}
+if (pinOk) {
+  startApp();
+} else {
+  showPinScreen();
+}
 </script>
 </body>
 </html>

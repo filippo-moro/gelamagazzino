@@ -101,6 +101,20 @@ main{max-width:800px;margin:0 auto;padding:16px 16px 100px}
 
 .stk-date{font-size:11px;color:#aaa;margin-top:2px}
 .stk-date.old{color:var(--red);font-weight:600}
+.cmp-wrap{background:var(--card);border-radius:14px;box-shadow:0 2px 12px rgba(0,0,0,.06);overflow-x:auto;margin-top:12px}
+.cmp-table{width:100%;border-collapse:collapse;font-size:13px}
+.cmp-table th{padding:8px 6px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;background:#f5f0eb;white-space:nowrap;text-align:center}
+.cmp-table th.shop{color:var(--dark);border-bottom:3px solid var(--brown);font-size:12px}
+.cmp-table th.shop small{display:block;font-weight:500;text-transform:none;letter-spacing:0;color:#aaa;font-size:10px}
+.cmp-table th.shop small.old{color:var(--red)}
+.cmp-table th:first-child,.cmp-table td:first-child{text-align:left;padding-left:14px;position:sticky;left:0;background:inherit}
+.cmp-table th:first-child{background:#f5f0eb}
+.cmp-table td{padding:9px 6px;text-align:center;border-bottom:1px solid var(--border);min-width:48px}
+.cmp-table tr:nth-child(even) td{background:#fdfcfa}
+.cmp-table tr:nth-child(odd) td{background:#fff}
+.cmp-table td.ord{font-weight:700;color:var(--green)}
+.cmp-table td.na{color:#ddd}
+.cmp-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
 .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--dark);color:#fff;padding:12px 20px;border-radius:12px;font-size:14px;font-weight:600;z-index:10000;box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:90vw;text-align:center}
 .toast.err{background:var(--red)}
 .db-error{background:#fdecea;color:#b3412b;padding:12px 16px;font-size:13px;font-weight:600;text-align:center}
@@ -177,6 +191,7 @@ let dbError = null;
 let listenersOn = false;
 let pendingRender = false;
 let renderTimer = null;
+let histRef = null;
 let state = {
   mode: localStorage.getItem('gm_mode') || null, // 'negozio' | 'gestione'
   shopId: localStorage.getItem('gm_shopId') || null,
@@ -186,6 +201,9 @@ let state = {
   products: [],
   stock: {},
   stockDates: {},
+  cmpSup: null,      // fornitore scelto nel Confronto
+  cmpDate: 'now',    // 'now' oppure data di un ordine passato (AAAA-MM-GG)
+  history: {},       // ultimi ordini del fornitore scelto
   notes: {},
   selSup: null,
   shopTab: null,
@@ -417,10 +435,26 @@ function attachDbListeners() {
     }
     scheduleRender();
   }, onDbError);
+
+  if (state.cmpSup) watchHistory(state.cmpSup);
+}
+
+// Storico: ultimi ordini inviati del fornitore scelto nel Confronto
+const HISTORY_SHOWN = 5;
+function watchHistory(supId) {
+  if (histRef) { histRef.off(); histRef = null; }
+  state.history = {};
+  if (!db || !listenersOn || !supId) return;
+  histRef = db.ref(`history/${supId}`).orderByKey().limitToLast(HISTORY_SHOWN);
+  histRef.on('value', snap => {
+    state.history = snap.val() || {};
+    scheduleRender();
+  }, onDbError);
 }
 
 function detachDbListeners() {
   if (!listenersOn || !db) return;
+  if (histRef) { histRef.off(); histRef = null; }
   DB_NODES.forEach(n => db.ref(n).off());
   listenersOn = false;
 }
@@ -819,7 +853,7 @@ function generateNegozioOrder(supId) {
 function renderGestione(app) {
   // Nav
   let nav = '<nav class="nav">';
-  [{id:'dash',icon:'📋',l:'Ordini'},{id:'products',icon:'📦',l:'Prodotti'},{id:'suppliers',icon:'🏪',l:'Fornitori'},{id:'shops',icon:'⚙️',l:'Negozi'}].forEach(t => {
+  [{id:'dash',icon:'📋',l:'Ordini'},{id:'compare',icon:'📊',l:'Confronto'},{id:'products',icon:'📦',l:'Prodotti'},{id:'suppliers',icon:'🏪',l:'Fornitori'},{id:'shops',icon:'⚙️',l:'Negozi'}].forEach(t => {
     nav += `<button class="${state.tab===t.id?'active':''}" onclick="setTab('${t.id}')">${t.icon}<br>${t.l}</button>`;
   });
   nav += '</nav>';
@@ -912,6 +946,9 @@ function renderGestione(app) {
       <button class="btn btn-green" onclick="generateOrder()">📤 Genera Ordine</button>
     </div>`;
 
+  } else if (state.tab === 'compare') {
+    html += renderConfronto();
+
   } else if (state.tab === 'products') {
     html += `<div style="display:flex;justify-content:space-between;align-items:center;margin:16px 0">
       <h3 class="section-title">📦 Prodotti <span style="font-weight:400;color:#aaa">(${state.products.length})</span></h3>
@@ -979,7 +1016,90 @@ function renderGestione(app) {
 }
 
 // ── Actions ──
-function setTab(t) { state.tab = t; state.selSup = null; render(); }
+function setTab(t) {
+  state.tab = t; state.selSup = null;
+  if (t === 'compare') {
+    if (!state.suppliers.some(s => s.id === state.cmpSup)) state.cmpSup = state.suppliers[0] ? state.suppliers[0].id : null;
+    state.cmpDate = 'now';
+    watchHistory(state.cmpSup);
+  }
+  render();
+}
+function setCmpSup(id) { state.cmpSup = id; state.cmpDate = 'now'; watchHistory(id); render(); }
+function setCmpDate(d) { state.cmpDate = d; render(); }
+
+// ── Confronto negozi + storico ordini ──
+function renderConfronto() {
+  const sup = state.suppliers.find(s => s.id === state.cmpSup);
+  let html = `<h3 class="section-title" style="margin-top:16px">📊 Confronto negozi</h3>`;
+  if (!sup) return html + `<div class="empty">Nessun fornitore</div>`;
+
+  const dates = Object.keys(state.history).sort().reverse();
+  const cur = dates.includes(state.cmpDate) ? state.cmpDate : 'now';
+  const relShops = state.shops.filter(s => sup.shopIds.includes(s.id));
+  const fmtDay = k => { const [y, m, d] = k.split('-'); return `${d}/${m}`; };
+
+  html += `<div class="field" style="margin-bottom:0"><label class="label">Fornitore</label>
+    <select class="input" onchange="setCmpSup(this.value)">${state.suppliers.map(s => `<option value="${s.id}" ${s.id === sup.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>`;
+
+  html += `<div class="cmp-chips"><span class="chip ${cur === 'now' ? 'active' : ''}" onclick="setCmpDate('now')">Adesso</span>`;
+  dates.forEach(d => { html += `<span class="chip ${cur === d ? 'active' : ''}" onclick="setCmpDate('${d}')">Ordine ${fmtDay(d)}</span>`; });
+  html += `</div>`;
+  if (dates.length === 0) html += `<p class="section-sub" style="margin:8px 0 0">Lo storico si riempie da solo: ogni ordine confermato come inviato viene salvato qui.</p>`;
+
+  // righe: [nome, unità, {shopId: {g, o} | null}]
+  const rows = [];
+  if (cur === 'now') {
+    const draft = state.allDrafts[sup.id] || {};
+    prodsForSup(sup.id).forEach(p => {
+      const cells = {};
+      relShops.forEach(sh => {
+        const k = `${p.id}_${sh.id}`;
+        cells[sh.id] = p.shops.includes(sh.id) ? { g: state.stock[k], o: draft[k] } : null;
+      });
+      rows.push([p.name, p.u, cells]);
+    });
+  } else {
+    const snap = state.history[cur] || {};
+    const byProd = {};
+    Object.entries(snap).forEach(([k, v]) => {
+      const i = k.lastIndexOf('_');
+      const pid = k.slice(0, i), shId = k.slice(i + 1);
+      (byProd[pid] = byProd[pid] || { n: v.n, cells: {} }).cells[shId] = v;
+    });
+    // prima i prodotti ancora in elenco (nel loro ordine), poi quelli eliminati nel frattempo
+    const order = prodsForSup(sup.id).map(p => p.id).filter(id => byProd[id]);
+    Object.keys(byProd).forEach(id => { if (!order.includes(id)) order.push(id); });
+    order.forEach(id => {
+      const p = state.products.find(x => x.id === id);
+      rows.push([p ? p.name : byProd[id].n, p ? p.u : '', byProd[id].cells]);
+    });
+  }
+
+  html += `<div class="cmp-wrap"><table class="cmp-table"><thead><tr><th rowspan="2">Prodotto</th>`;
+  relShops.forEach(sh => {
+    let sub = '';
+    if (cur === 'now') {
+      const last = lastStockUpdate(sup.id, sh.id);
+      sub = `<small class="${!last || daysAgo(last) >= STOCK_OLD_DAYS ? 'old' : ''}">giac. ${last ? fmtStockDate(last) : 'mai compilate'}</small>`;
+    }
+    html += `<th class="shop" colspan="2">${esc(sh.name)}${sub}</th>`;
+  });
+  html += `</tr><tr>${relShops.map(() => `<th>Giac.</th><th>Ord.</th>`).join('')}</tr></thead><tbody>`;
+  const val = v => (v === undefined || v === null || v === '') ? '<span style="color:#ddd">—</span>' : esc(v);
+  rows.forEach(([name, u, cells]) => {
+    html += `<tr><td><strong>${esc(name)}</strong>${u ? ` <span style="font-size:11px;color:#aaa">(${esc(u)})</span>` : ''}</td>`;
+    relShops.forEach(sh => {
+      const c = cells[sh.id];
+      if (c === null) html += `<td class="na" colspan="2">non previsto</td>`;
+      else html += `<td>${val(c && c.g)}</td><td class="ord">${val(c && Number(c.o) > 0 ? c.o : '')}</td>`;
+    });
+    html += `</tr>`;
+  });
+  if (rows.length === 0) html += `<tr><td colspan="${1 + relShops.length * 2}" style="text-align:center;color:#bbb;padding:24px">Nessun dato</td></tr>`;
+  html += `</tbody></table></div>`;
+  return html;
+}
 function startOrder(supId) { state.selSup = state.suppliers.find(s => s.id === supId); state.draft = state.allDrafts[supId] || {}; state.draftNote = (state.notes[`${supId}_gestione`] || {}).text || ''; state.tab = 'order'; const rs = state.shops.filter(s => state.selSup.shopIds.includes(s.id)); state.shopTab = rs[0]?.id; render(); }
 function setShopTab(id) { state.shopTab = id; render(); }
 function cancelOrder() { state.selSup = null; state.tab = 'dash'; render(); }
@@ -995,6 +1115,30 @@ function setDraft(pid, sid, val) {
   } else {
     localStorage.setItem('gm_drafts', JSON.stringify(state.allDrafts));
   }
+}
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Fotografa giacenze e quantità ordinate nello storico (una pagina per giorno e fornitore).
+// In modalità Negozio salva solo il proprio negozio: gli ordini dello stesso giorno si sommano.
+function saveHistory(supId) {
+  if (!db) return;
+  const sup = state.suppliers.find(s => s.id === supId);
+  if (!sup) return;
+  const shopIds = state.mode === 'negozio' ? [state.shopId] : state.shops.filter(s => sup.shopIds.includes(s.id)).map(s => s.id);
+  const draft = state.allDrafts[supId] || {};
+  const upd = {};
+  shopIds.forEach(shId => prodsForSupShop(supId, shId).forEach(p => {
+    const k = `${p.id}_${shId}`;
+    const g = state.stock[k], o = draft[k];
+    const hasG = g !== undefined && g !== null && g !== '';
+    const hasO = !!o && Number(o) > 0;
+    if (hasG || hasO) upd[k] = { n: p.name, g: hasG ? g : '', o: hasO ? o : '' };
+  }));
+  if (Object.keys(upd).length) w(db.ref(`history/${supId}/${todayKey()}`).update(upd));
 }
 
 // Azzera le quantità ordinate: in modalità Negozio solo quelle del proprio negozio
@@ -1049,6 +1193,7 @@ function renderMsgModal(app) {
 function closeMsgModal() {
   const supId = state.selSup ? state.selSup.id : null;
   if (supId && confirm("Ordine inviato?\n\nOK = azzera le quantità ordinate\nAnnulla = conservale per dopo")) {
+    saveHistory(supId);
     clearDraft(supId);
   }
   state.msgModal = null; state.selSup = null; state.tab = 'dash'; state.draft = {}; state.draftNote = ''; render();

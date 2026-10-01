@@ -99,6 +99,13 @@ main{max-width:800px;margin:0 auto;padding:16px 16px 100px}
   .shop-tab{font-size:12px;padding:10px 6px}
 }
 
+.stk-date{font-size:11px;color:#aaa;margin-top:2px}
+.stk-date.old{color:var(--red);font-weight:600}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--dark);color:#fff;padding:12px 20px;border-radius:12px;font-size:14px;font-weight:600;z-index:10000;box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:90vw;text-align:center}
+.toast.err{background:var(--red)}
+.db-error{background:#fdecea;color:#b3412b;padding:12px 16px;font-size:13px;font-weight:600;text-align:center}
+.lock-link{background:none;border:none;color:#aaa;font-size:12px;margin-top:20px;text-decoration:underline}
+
 /* ── Schermata PIN ── */
 .pin-screen{position:fixed;inset:0;background:linear-gradient(135deg,var(--dark),var(--dark2));display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;padding:20px}
 .pin-screen h1{font-family:'Playfair Display',serif;color:#fff;font-size:32px;margin-bottom:8px}
@@ -137,9 +144,14 @@ const FIREBASE_CONFIG = {
   projectId: "gelamagazzino-6de61"
 };
 // ═══════════════════════════════════════════════
-// 🔐 PIN DI ACCESSO — MODIFICA QUI PER CAMBIARLO
+// 🔐 ACCESSO
+// Il PIN NON è più scritto qui: è la password dell'utente qui sotto,
+// creato in Firebase → Authentication → Users. Per cambiare il PIN
+// si cambia la password di quell'utente dalla console Firebase.
 // ═══════════════════════════════════════════════
-const APP_PIN = "0708";
+const AUTH_EMAIL = "accesso@gelamagazzino.app";
+const PIN_LENGTH = 6;
+const STOCK_OLD_DAYS = 7; // oltre questi giorni la giacenza è segnalata come vecchia
 // ═══════════════════════════════════════════════
 
 const DAYS = ["Domenica","Lunedì","Martedì","Mercoledì","Giovedì","Venerdì","Sabato"];
@@ -161,6 +173,10 @@ const h = (html) => { const t = document.createElement('template'); t.innerHTML 
 // ── State ──
 let db = null;
 let connected = false;
+let dbError = null;
+let listenersOn = false;
+let pendingRender = false;
+let renderTimer = null;
 let state = {
   mode: localStorage.getItem('gm_mode') || null, // 'negozio' | 'gestione'
   shopId: localStorage.getItem('gm_shopId') || null,
@@ -169,6 +185,7 @@ let state = {
   suppliers: [],
   products: [],
   stock: {},
+  stockDates: {},
   notes: {},
   selSup: null,
   shopTab: null,
@@ -313,72 +330,171 @@ function initFirebase() {
   try {
     firebase.initializeApp(FIREBASE_CONFIG);
     db = firebase.database();
-    connected = true;
-
-    // Autenticazione anonima — necessaria per le regole di sicurezza
-    firebase.auth().signInAnonymously().catch(err => {
-      console.error("Errore autenticazione:", err);
-    });
-
-    // Aspetta che l'autenticazione sia attiva prima di leggere i dati
-    firebase.auth().onAuthStateChanged(user => {
-      if (!user) return;
-      attachDbListeners();
-    });
-
   } catch(e) {
     console.error("Firebase error:", e);
-    loadFromLocal();
+    db = null;
+    dbError = "Impossibile avviare il collegamento al database. Ricarica la pagina.";
     render();
+    return;
   }
+
+  // Stato reale della connessione (pallino verde/rosso)
+  db.ref('.info/connected').on('value', snap => {
+    connected = !!snap.val();
+    document.querySelectorAll('.sync-dot').forEach(d => {
+      d.classList.toggle('on', connected);
+      d.classList.toggle('off', !connected);
+    });
+  });
+
+  // I dati si leggono solo dopo l'accesso con il PIN
+  firebase.auth().onAuthStateChanged(user => {
+    if (user && !user.isAnonymous) {
+      hidePinScreen();
+      attachDbListeners();
+      render();
+    } else {
+      detachDbListeners();
+      document.getElementById('app').innerHTML = '';
+      if (user) { firebase.auth().signOut(); return; } // vecchie sessioni anonime
+      showPinScreen();
+    }
+  });
+}
+
+const DB_NODES = ['config', 'stock', 'stockDates', 'notes', 'drafts'];
+
+function onDbError(err) {
+  console.error("Errore database:", err);
+  dbError = (err && err.code === 'PERMISSION_DENIED')
+    ? "Accesso ai dati negato. Esci e reinserisci il PIN."
+    : "Errore nel leggere i dati. Controlla la connessione.";
+  render();
 }
 
 function attachDbListeners() {
-  try {
-    // Listen for config
-    db.ref('config').on('value', snap => {
-      const d = snap.val();
-      if (d) {
-        state.shops = d.shops || DEFAULTS.shops;
-        state.suppliers = d.sups || DEFAULTS.suppliers;
-        state.products = d.prods || DEFAULTS.products;
-      } else {
-        // First time: write defaults
-        state.shops = DEFAULTS.shops;
-        state.suppliers = DEFAULTS.suppliers;
-        state.products = DEFAULTS.products;
-        db.ref('config').set({ shops: state.shops, sups: state.suppliers, prods: state.products });
-      }
-      render();
-    });
+  if (listenersOn) return;
+  listenersOn = true;
+  dbError = null;
 
-    // Listen for stock
-    db.ref('stock').on('value', snap => {
-      state.stock = snap.val() || {};
-      render();
-    });
+  db.ref('config').on('value', snap => {
+    const d = snap.val();
+    if (d) {
+      state.shops = d.shops || DEFAULTS.shops;
+      state.suppliers = d.sups || DEFAULTS.suppliers;
+      state.products = d.prods || DEFAULTS.products;
+    } else {
+      // First time: write defaults
+      state.shops = DEFAULTS.shops;
+      state.suppliers = DEFAULTS.suppliers;
+      state.products = DEFAULTS.products;
+      w(db.ref('config').set({ shops: state.shops, sups: state.suppliers, prods: state.products }));
+    }
+    if (state.selSup) state.selSup = state.suppliers.find(s => s.id === state.selSup.id) || null;
+    scheduleRender();
+  }, onDbError);
 
-    // Listen for notes
-    db.ref('notes').on('value', snap => {
-      state.notes = snap.val() || {};
-      render();
-    });
+  db.ref('stock').on('value', snap => {
+    state.stock = snap.val() || {};
+    scheduleRender();
+  }, onDbError);
 
-    // Listen for drafts (order quantities in progress)
-    db.ref('drafts').on('value', snap => {
-      state.allDrafts = snap.val() || {};
-      // Load current supplier draft if active
-      if (state.selSup) {
-        state.draft = state.allDrafts[state.selSup.id] || {};
-      }
-      render();
-    });
+  db.ref('stockDates').on('value', snap => {
+    state.stockDates = snap.val() || {};
+    scheduleRender();
+  }, onDbError);
 
-  } catch(e) {
-    console.error("Firebase listeners error:", e);
-    loadFromLocal();
+  db.ref('notes').on('value', snap => {
+    state.notes = snap.val() || {};
+    scheduleRender();
+  }, onDbError);
+
+  // Quantità d'ordine in corso (condivise tra i dispositivi)
+  db.ref('drafts').on('value', snap => {
+    state.allDrafts = snap.val() || {};
+    if (state.selSup) {
+      state.draft = state.allDrafts[state.selSup.id] || {};
+    }
+    scheduleRender();
+  }, onDbError);
+}
+
+function detachDbListeners() {
+  if (!listenersOn || !db) return;
+  DB_NODES.forEach(n => db.ref(n).off());
+  listenersOn = false;
+}
+
+// Segnala a schermo se un salvataggio viene rifiutato
+function w(promise) {
+  if (promise && promise.catch) promise.catch(err => {
+    console.error("Salvataggio fallito:", err);
+    toast("⚠ Non salvato! Controlla la connessione e riprova.", true);
+  });
+  return promise;
+}
+
+function toast(text, isErr) {
+  document.querySelectorAll('.toast').forEach(t => t.remove());
+  const t = document.createElement('div');
+  t.className = 'toast' + (isErr ? ' err' : '');
+  t.textContent = text;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), isErr ? 5000 : 2500);
+}
+
+// ── Ridisegno "gentile" ──
+// Gli aggiornamenti che arrivano dagli altri dispositivi non ridisegnano
+// la pagina mentre qualcuno sta scrivendo in un campo: aspettano che finisca.
+function isEditing() {
+  const a = document.activeElement;
+  return !!a && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName) && document.getElementById('app').contains(a);
+}
+function scheduleRender() {
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(() => {
+    if (isEditing()) { pendingRender = true; return; }
+    pendingRender = false;
     render();
-  }
+  }, 300);
+}
+document.addEventListener('focusout', () => {
+  if (pendingRender) scheduleRender();
+});
+
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Data dell'ultimo aggiornamento di una giacenza
+function daysAgo(ts) {
+  const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+  const d1 = new Date(ts); d1.setHours(0, 0, 0, 0);
+  return Math.round((d0 - d1) / 86400000);
+}
+function fmtStockDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const n = daysAgo(ts);
+  const hm = d.toLocaleTimeString("it-IT", { hour: '2-digit', minute: '2-digit' });
+  const dm = d.toLocaleDateString("it-IT", { day: '2-digit', month: '2-digit' });
+  if (n <= 0) return `oggi ${hm}`;
+  if (n === 1) return `ieri ${hm}`;
+  return `${dm} (${n} gg fa)`;
+}
+function stockDateHtml(prodId, shopId) {
+  const ts = state.stockDates[`${prodId}_${shopId}`];
+  if (!ts) return '';
+  return `<div class="stk-date ${daysAgo(ts) >= STOCK_OLD_DAYS ? 'old' : ''}">giac. agg. ${fmtStockDate(ts)}</div>`;
+}
+// Ultimo aggiornamento giacenze di un negozio per un fornitore
+function lastStockUpdate(supId, shopId) {
+  let last = 0;
+  prodsForSupShop(supId, shopId).forEach(p => {
+    const ts = state.stockDates[`${p.id}_${shopId}`];
+    if (ts && ts > last) last = ts;
+  });
+  return last;
 }
 
 function loadFromLocal() {
@@ -403,21 +519,34 @@ function loadFromLocal() {
   }
 }
 
-function saveConfig() {
+// Salva solo l'elenco modificato ('shops', 'sups', 'prods'), non tutta la configurazione
+function saveConfig(...parts) {
+  const all = { shops: state.shops, sups: state.suppliers, prods: state.products };
   if (db) {
-    db.ref('config').set({ shops: state.shops, sups: state.suppliers, prods: state.products });
+    const upd = {};
+    (parts.length ? parts : Object.keys(all)).forEach(k => upd[k] = all[k]);
+    w(db.ref('config').update(upd));
   } else {
-    localStorage.setItem('gm_data', JSON.stringify({ shops: state.shops, sups: state.suppliers, prods: state.products, stock: state.stock, notes: state.notes }));
+    saveLocal();
   }
+}
+
+function saveLocal() {
+  localStorage.setItem('gm_data', JSON.stringify({ shops: state.shops, sups: state.suppliers, prods: state.products, stock: state.stock, notes: state.notes }));
 }
 
 function saveStock(prodId, shopId, val) {
   const key = `${prodId}_${shopId}`;
   state.stock[key] = val;
   if (db) {
-    db.ref(`stock/${key}`).set(val);
+    // valore + data dell'ultimo aggiornamento, scritti insieme
+    w(db.ref().update({
+      [`stock/${key}`]: val,
+      [`stockDates/${key}`]: firebase.database.ServerValue.TIMESTAMP
+    }));
   } else {
-    localStorage.setItem('gm_data', JSON.stringify({ shops: state.shops, sups: state.suppliers, prods: state.products, stock: state.stock, notes: state.notes }));
+    state.stockDates[key] = Date.now();
+    saveLocal();
   }
 }
 
@@ -425,9 +554,9 @@ function saveNote(supId, shopId, text) {
   const key = `${supId}_${shopId}`;
   state.notes[key] = { text, date: new Date().toISOString() };
   if (db) {
-    db.ref(`notes/${key}`).set(state.notes[key]);
+    w(db.ref(`notes/${key}`).set(state.notes[key]));
   } else {
-    localStorage.setItem('gm_data', JSON.stringify({ shops: state.shops, sups: state.suppliers, prods: state.products, stock: state.stock, notes: state.notes }));
+    saveLocal();
   }
 }
 
@@ -471,13 +600,13 @@ function render() {
 
   // ── Setup Screen ──
   if (!state.mode) {
-    app.appendChild(renderSetup());
+    app.appendChild(state.pickShop ? renderShopPicker() : renderSetup());
     return;
   }
 
   // ── Header ──
   const myShop = state.shops.find(s => s.id === state.shopId);
-  const modeLabel = state.mode === 'negozio' ? `🍦 ${myShop ? myShop.name : ''}` : '👤 Gestione';
+  const modeLabel = state.mode === 'negozio' ? `🍦 ${esc(myShop ? myShop.name : '')}` : '👤 Gestione';
 
   app.innerHTML = `
     <div class="header">
@@ -491,6 +620,7 @@ function render() {
         ${modeLabel}
       </button>
     </div>
+    ${dbError ? `<div class="db-error">⚠ ${esc(dbError)}</div>` : ''}
   `;
 
   if (state.mode === 'negozio') {
@@ -525,15 +655,16 @@ function renderSetup() {
         </button>
         <p style="font-size:12px;color:#aaa;margin:-4px 0">Per te — vedi tutto, gestisci e ordina</p>
       </div>
+      ${dbError ? `<p style="color:var(--red);font-size:13px;font-weight:600;margin-top:20px">⚠ ${esc(dbError)}</p>` : ''}
+      ${db ? `<button class="lock-link" onclick="lockApp()">🔒 Esci e blocca con PIN</button>` : ''}
     </div>
   `;
   return div;
 }
 
-function chooseNegozio() {
-  // Show shop picker
-  const app = document.getElementById('app');
-  app.innerHTML = '';
+function chooseNegozio() { state.pickShop = true; render(); }
+
+function renderShopPicker() {
   const div = document.createElement('div');
   div.className = 'setup-screen';
   let html = `<div class="setup-card">
@@ -542,17 +673,18 @@ function chooseNegozio() {
     <p style="color:#999;font-size:14px;margin-bottom:32px">Questo dispositivo mostrerà solo i prodotti di questo negozio</p>
     <div style="display:flex;flex-direction:column;gap:12px">`;
   state.shops.forEach(sh => {
-    html += `<button class="btn btn-primary" style="width:100%;justify-content:center;padding:16px" onclick="setMode('negozio','${sh.id}')">🍦 ${sh.name}</button>`;
+    html += `<button class="btn btn-primary" style="width:100%;justify-content:center;padding:16px" onclick="setMode('negozio','${sh.id}')">🍦 ${esc(sh.name)}</button>`;
   });
-  html += `<button class="btn btn-secondary" style="width:100%;justify-content:center;margin-top:8px" onclick="render()">← Indietro</button>`;
+  html += `<button class="btn btn-secondary" style="width:100%;justify-content:center;margin-top:8px" onclick="state.pickShop=false;render()">← Indietro</button>`;
   html += `</div></div>`;
   div.innerHTML = html;
-  app.appendChild(div);
+  return div;
 }
 
 function chooseGestione() { setMode('gestione', null); }
 
 function setMode(mode, shopId) {
+  state.pickShop = false;
   state.mode = mode;
   state.shopId = shopId;
   localStorage.setItem('gm_mode', mode);
@@ -577,7 +709,7 @@ function renderNegozio(app) {
 
   let html = '<main>';
   html += `<h3 class="section-title" style="margin-top:16px">📋 Fornitori</h3>`;
-  html += `<p class="section-sub">Compila le giacenze per ${shopName(shopId)}</p>`;
+  html += `<p class="section-sub">Compila le giacenze per ${esc(shopName(shopId))}</p>`;
 
   if (state.tab === 'dash' || !state.selSup) {
     // Supplier list
@@ -589,10 +721,10 @@ function renderNegozio(app) {
         <div class="card card-accent">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div>
-              <h4>${sup.name}</h4>
-              <p class="sub">${sup.note || ''}</p>
+              <h4>${esc(sup.name)}</h4>
+              <p class="sub">${esc(sup.note || '')}</p>
               <p class="count">${cnt} prodotti</p>
-              ${existingNote && existingNote.text ? `<p style="margin-top:6px;padding:6px 10px;background:#fff8f0;border-radius:6px;font-size:12px;color:#8b7355;border-left:3px solid var(--brown)">📝 ${existingNote.text}</p>` : ''}
+              ${existingNote && existingNote.text ? `<p style="margin-top:6px;padding:6px 10px;background:#fff8f0;border-radius:6px;font-size:12px;color:#8b7355;border-left:3px solid var(--brown)">📝 ${esc(existingNote.text)}</p>` : ''}
             </div>
             <button class="btn btn-primary" onclick="openNegozioSup('${sup.id}')">Compila</button>
           </div>
@@ -606,8 +738,8 @@ function renderNegozio(app) {
 
     html += `<button class="btn btn-secondary btn-small" style="margin-bottom:16px" onclick="closeNegozioSup()">← Torna ai fornitori</button>`;
     html += `<div class="card" style="background:linear-gradient(135deg,var(--dark),var(--dark2));color:#fff;margin-bottom:20px">
-      <h2 style="font-family:'Playfair Display',serif;font-size:20px">${sup.name}</h2>
-      ${sup.note ? `<p style="font-size:13px;opacity:.7">${sup.note}</p>` : ''}
+      <h2 style="font-family:'Playfair Display',serif;font-size:20px">${esc(sup.name)}</h2>
+      ${sup.note ? `<p style="font-size:13px;opacity:.7">${esc(sup.note)}</p>` : ''}
     </div>`;
 
     html += `<div class="grid-header"><span>Prodotto</span><span>📦 Giac.</span><span>🛒 Ord.</span></div>`;
@@ -615,14 +747,14 @@ function renderNegozio(app) {
       const val = state.stock[`${p.id}_${shopId}`] || '';
       const ord = state.draft[`${p.id}_${shopId}`] || '';
       html += `<div class="grid-row">
-        <div><strong style="font-size:14px">${p.name}</strong>${p.u ? ` <span style="font-size:11px;color:#aaa">(${p.u})</span>` : ''}</div>
+        <div><strong style="font-size:14px">${esc(p.name)}</strong>${p.u ? ` <span style="font-size:11px;color:#aaa">(${esc(p.u)})</span>` : ''}${stockDateHtml(p.id, shopId)}</div>
         <input class="inv-input" type="number" min="0" step="any" placeholder="—" value="${val}" onchange="saveStock('${p.id}','${shopId}',this.value)">
         <input class="ord-input" type="number" min="0" step="any" placeholder="—" value="${ord}" onchange="setDraft('${p.id}','${shopId}',this.value)">
       </div>`;
     });
 
     // Count
-    const totalOrd = Object.entries(state.draft).filter(([,q]) => q && Number(q) > 0).length;
+    const totalOrd = Object.entries(state.draft).filter(([k,q]) => k.endsWith('_' + shopId) && q && Number(q) > 0).length;
     if (totalOrd > 0) {
       html += `<div style="background:#f0ebe4;border-radius:12px;padding:12px 16px;margin-top:16px;font-size:13px;color:#6b5d4f"><strong>${totalOrd}</strong> prodotti nell'ordine</div>`;
     }
@@ -630,8 +762,8 @@ function renderNegozio(app) {
     // Note
     const existingNote = state.notes[noteKey];
     html += `<div style="margin-top:16px">
-      <label class="label">📝 Note per ${sup.name}</label>
-      <textarea class="note-area" placeholder="Scrivi qui note, segnalazioni..." onchange="saveNote('${sup.id}','${shopId}',this.value)">${existingNote ? existingNote.text || '' : ''}</textarea>
+      <label class="label">📝 Note per ${esc(sup.name)}</label>
+      <textarea class="note-area" placeholder="Scrivi qui note, segnalazioni..." onchange="saveNote('${sup.id}','${shopId}',this.value)">${esc(existingNote ? existingNote.text || '' : '')}</textarea>
     </div>`;
     html += `<div style="margin-top:20px;display:flex;gap:12px">
       <button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="closeNegozioSup()">← Torna</button>
@@ -674,7 +806,7 @@ function generateNegozioOrder(supId) {
   }
   const noteKey = `${sup.id}_${shopId}`;
   const n = state.notes[noteKey];
-  if (n && n.text) { lines.push(`📝 Note: ${n.text}`); lines.push(''); }
+  if (n && n.text) { lines.push(`📝 Note: ${esc(n.text)}`); lines.push(''); }
   if (items.length === 0 && !(n && n.text)) return;
   state.msgModal = lines.join('\n');
   state.copied = false;
@@ -700,21 +832,25 @@ function renderGestione(app) {
     html += `<h3 class="section-title" style="margin-top:16px">📋 Scegli un fornitore per ordinare</h3>`;
     state.suppliers.forEach(sup => {
       const cnt = prodsForSup(sup.id).length;
-      const shopBadges = state.shops.filter(s => sup.shopIds.includes(s.id)).map(s => `<span class="badge badge-on">${s.name}</span>`).join('');
+      const shopBadges = state.shops.filter(s => sup.shopIds.includes(s.id)).map(s => {
+        const last = lastStockUpdate(sup.id, s.id);
+        const old = !last || daysAgo(last) >= STOCK_OLD_DAYS;
+        return `<span class="badge ${old ? 'badge-off' : 'badge-on'}" ${old ? 'style="color:var(--red)"' : ''}>${esc(s.name)} · ${last ? fmtStockDate(last) : 'mai compilato'}</span>`;
+      }).join('');
       // Show existing notes from shops
       let noteHtml = '';
       state.shops.forEach(sh => {
         const nk = `${sup.id}_${sh.id}`;
         const n = state.notes[nk];
-        if (n && n.text) noteHtml += `<div style="margin-top:6px;padding:6px 10px;background:#fff8f0;border-radius:6px;font-size:11px;color:#8b7355;border-left:3px solid var(--brown)">📝 <strong>${sh.name}:</strong> ${n.text}</div>`;
+        if (n && n.text) noteHtml += `<div style="margin-top:6px;padding:6px 10px;background:#fff8f0;border-radius:6px;font-size:11px;color:#8b7355;border-left:3px solid var(--brown)">📝 <strong>${esc(sh.name)}:</strong> ${esc(n.text)}</div>`;
       });
       html += `<div class="card card-accent">
         <div style="display:flex;justify-content:space-between;align-items:center">
           <div>
-            <h4>${sup.name}</h4>
-            <p class="sub">${sup.note || ''}</p>
+            <h4>${esc(sup.name)}</h4>
+            <p class="sub">${esc(sup.note || '')}</p>
             <div style="margin-top:6px">${shopBadges}</div>
-            <p class="count">${cnt} prodotti</p>
+            <p class="count">${cnt} prodotti · date = ultimo aggiornamento giacenze</p>
             ${noteHtml}
           </div>
           <button class="btn btn-primary" onclick="startOrder('${sup.id}')">Ordina</button>
@@ -730,15 +866,15 @@ function renderGestione(app) {
 
     html += `<button class="btn btn-secondary btn-small" style="margin:16px 0" onclick="cancelOrder()">← Torna</button>`;
     html += `<div class="card" style="background:linear-gradient(135deg,var(--dark),var(--dark2));color:#fff">
-      <h2 style="font-family:'Playfair Display',serif;font-size:20px">Ordine — ${sup.name}</h2>
-      ${sup.note ? `<p style="font-size:13px;opacity:.7">${sup.note}</p>` : ''}
+      <h2 style="font-family:'Playfair Display',serif;font-size:20px">Ordine — ${esc(sup.name)}</h2>
+      ${sup.note ? `<p style="font-size:13px;opacity:.7">${esc(sup.note)}</p>` : ''}
     </div>`;
 
     // Shop tabs
     html += '<div class="shop-tabs" style="margin-top:16px">';
     relShops.forEach(sh => {
       const cnt = prodsForSupShop(sup.id, sh.id).length;
-      html += `<button class="shop-tab ${curShop===sh.id?'active':''}" onclick="setShopTab('${sh.id}')">🍦 ${sh.name} (${cnt})</button>`;
+      html += `<button class="shop-tab ${curShop===sh.id?'active':''}" onclick="setShopTab('${sh.id}')">🍦 ${esc(sh.name)} (${cnt})</button>`;
     });
     html += '</div>';
 
@@ -746,13 +882,13 @@ function renderGestione(app) {
     const prods = prodsForSupShop(sup.id, curShop);
     html += `<div class="grid-header"><span>Prodotto</span><span>📦 Giac.</span><span>🛒 Ord.</span></div>`;
     if (prods.length === 0) {
-      html += `<div style="padding:24px;text-align:center;color:#ccc;background:#fff;border:1px solid var(--border);border-top:none">Nessun prodotto per ${shopName(curShop)}</div>`;
+      html += `<div style="padding:24px;text-align:center;color:#ccc;background:#fff;border:1px solid var(--border);border-top:none">Nessun prodotto per ${esc(shopName(curShop))}</div>`;
     } else {
       prods.forEach(p => {
         const inv = state.stock[`${p.id}_${curShop}`] || '';
         const ord = state.draft[`${p.id}_${curShop}`] || '';
         html += `<div class="grid-row">
-          <div><strong style="font-size:14px">${p.name}</strong>${p.u ? ` <span style="font-size:11px;color:#aaa">(${p.u})</span>` : ''}</div>
+          <div><strong style="font-size:14px">${esc(p.name)}</strong>${p.u ? ` <span style="font-size:11px;color:#aaa">(${esc(p.u)})</span>` : ''}${stockDateHtml(p.id, curShop)}</div>
           <input class="inv-input" type="number" min="0" step="any" placeholder="—" value="${inv}" onchange="saveStock('${p.id}','${curShop}',this.value)">
           <input class="ord-input" type="number" min="0" step="any" placeholder="—" value="${ord}" onchange="setDraft('${p.id}','${curShop}',this.value)">
         </div>`;
@@ -768,7 +904,7 @@ function renderGestione(app) {
     // Note
     html += `<div style="margin-top:16px">
       <label class="label">📝 Note</label>
-      <textarea class="note-area" placeholder="Note, segnalazioni..." oninput="state.draftNote=this.value">${state.draftNote}</textarea>
+      <textarea class="note-area" placeholder="Note, segnalazioni..." oninput="state.draftNote=this.value" onchange="saveNote('${sup.id}','gestione',this.value)">${esc(state.draftNote)}</textarea>
     </div>`;
 
     html += `<div style="margin-top:20px;display:flex;gap:12px;justify-content:flex-end">
@@ -782,12 +918,12 @@ function renderGestione(app) {
       <button class="btn btn-primary btn-small" onclick="newProduct()">+ Nuovo</button>
     </div>`;
     state.suppliers.filter(s => prodsForSup(s.id).length > 0).forEach(sup => {
-      html += `<div class="supplier-section"><h4>${sup.name} <span style="color:#ccc;font-weight:400">(${prodsForSup(sup.id).length})</span></h4>`;
+      html += `<div class="supplier-section"><h4>${esc(sup.name)} <span style="color:#ccc;font-weight:400">(${prodsForSup(sup.id).length})</span></h4>`;
       html += `<div class="card" style="padding:0;overflow:hidden">`;
       prodsForSup(sup.id).forEach(p => {
-        const badges = state.shops.map(sh => `<span class="badge ${p.shops.includes(sh.id)?'badge-on':'badge-off'}">${sh.name}</span>`).join('');
+        const badges = state.shops.map(sh => `<span class="badge ${p.shops.includes(sh.id)?'badge-on':'badge-off'}">${esc(sh.name)}</span>`).join('');
         html += `<div class="list-item">
-          <div><strong>${p.name}</strong>${p.u?` <span style="color:#aaa;font-size:12px">(${p.u})</span>`:''}<div style="margin-top:4px">${badges}</div></div>
+          <div><strong>${esc(p.name)}</strong>${p.u?` <span style="color:#aaa;font-size:12px">(${esc(p.u)})</span>`:''}<div style="margin-top:4px">${badges}</div></div>
           <div style="display:flex;gap:6px;flex-shrink:0">
             <button class="btn-icon" onclick="editProduct('${p.id}')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
             <button class="btn-icon danger" onclick="delProduct('${p.id}')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg></button>
@@ -803,12 +939,12 @@ function renderGestione(app) {
       <button class="btn btn-primary btn-small" onclick="newSupplier()">+ Nuovo</button>
     </div>`;
     state.suppliers.forEach(sup => {
-      const badges = state.shops.map(sh => `<span class="badge ${sup.shopIds.includes(sh.id)?'badge-on':'badge-off'}">${sh.name}</span>`).join('');
+      const badges = state.shops.map(sh => `<span class="badge ${sup.shopIds.includes(sh.id)?'badge-on':'badge-off'}">${esc(sh.name)}</span>`).join('');
       html += `<div class="card">
         <div style="display:flex;justify-content:space-between;align-items:flex-start">
           <div>
-            <h4>${sup.name}</h4>
-            ${sup.note?`<p class="sub" style="font-style:italic">${sup.note}</p>`:''}
+            <h4>${esc(sup.name)}</h4>
+            ${sup.note?`<p class="sub" style="font-style:italic">${esc(sup.note)}</p>`:''}
             <div style="margin-top:8px">${badges}</div>
             <p class="count">${prodsForSup(sup.id).length} prodotti</p>
           </div>
@@ -829,7 +965,7 @@ function renderGestione(app) {
       const nSup = state.suppliers.filter(s => s.shopIds.includes(sh.id)).length;
       const nProd = state.products.filter(p => p.shops.includes(sh.id)).length;
       html += `<div class="card" style="display:flex;justify-content:space-between;align-items:center">
-        <div><strong style="font-size:15px">${sh.name}</strong><p class="count">${nSup} fornitori · ${nProd} prodotti</p></div>
+        <div><strong style="font-size:15px">${esc(sh.name)}</strong><p class="count">${nSup} fornitori · ${nProd} prodotti</p></div>
         <div style="display:flex;gap:6px">
           <button class="btn-icon" onclick="editShop('${sh.id}')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
           ${state.shops.length>1?`<button class="btn-icon danger" onclick="delShop('${sh.id}')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg></button>`:''}
@@ -844,20 +980,40 @@ function renderGestione(app) {
 
 // ── Actions ──
 function setTab(t) { state.tab = t; state.selSup = null; render(); }
-function startOrder(supId) { state.selSup = state.suppliers.find(s => s.id === supId); state.draft = state.allDrafts[supId] || {}; state.draftNote = ''; state.tab = 'order'; const rs = state.shops.filter(s => state.selSup.shopIds.includes(s.id)); state.shopTab = rs[0]?.id; render(); }
+function startOrder(supId) { state.selSup = state.suppliers.find(s => s.id === supId); state.draft = state.allDrafts[supId] || {}; state.draftNote = (state.notes[`${supId}_gestione`] || {}).text || ''; state.tab = 'order'; const rs = state.shops.filter(s => state.selSup.shopIds.includes(s.id)); state.shopTab = rs[0]?.id; render(); }
 function setShopTab(id) { state.shopTab = id; render(); }
 function cancelOrder() { state.selSup = null; state.tab = 'dash'; render(); }
 function setDraft(pid, sid, val) {
-  state.draft[`${pid}_${sid}`] = val;
-  // Persist to Firebase
+  const key = `${pid}_${sid}`;
+  state.draft[key] = val;
   const supId = state.selSup ? state.selSup.id : null;
-  if (supId) {
-    if (db) {
-      db.ref(`drafts/${supId}`).set(state.draft);
+  if (!supId) return;
+  state.allDrafts[supId] = state.draft;
+  if (db) {
+    // solo questa quantità: non tocca quelle inserite dagli altri negozi
+    w(db.ref(`drafts/${supId}/${key}`).set(val === '' ? null : val));
+  } else {
+    localStorage.setItem('gm_drafts', JSON.stringify(state.allDrafts));
+  }
+}
+
+// Azzera le quantità ordinate: in modalità Negozio solo quelle del proprio negozio
+function clearDraft(supId) {
+  const onlyShop = state.mode === 'negozio' ? state.shopId : null;
+  const cur = state.allDrafts[supId] || {};
+  if (db) {
+    if (onlyShop) {
+      const upd = {};
+      Object.keys(cur).filter(k => k.endsWith('_' + onlyShop)).forEach(k => upd[k] = null);
+      if (Object.keys(upd).length) w(db.ref(`drafts/${supId}`).update(upd));
     } else {
-      state.allDrafts[supId] = state.draft;
-      localStorage.setItem('gm_drafts', JSON.stringify(state.allDrafts));
+      w(db.ref(`drafts/${supId}`).remove());
+      w(db.ref(`notes/${supId}_gestione`).remove());
     }
+  } else {
+    if (onlyShop) Object.keys(cur).filter(k => k.endsWith('_' + onlyShop)).forEach(k => delete cur[k]);
+    else delete state.allDrafts[supId];
+    localStorage.setItem('gm_drafts', JSON.stringify(state.allDrafts));
   }
 }
 
@@ -877,7 +1033,7 @@ function renderMsgModal(app) {
       <div class="modal wide">
         <div class="modal-head"><h3>📋 Ordine pronto!</h3><button class="btn-icon" onclick="closeMsgModal()">✕</button></div>
         <div class="modal-body">
-          <pre class="msg-box">${state.msgModal}</pre>
+          <pre class="msg-box">${esc(state.msgModal)}</pre>
           <div style="display:flex;gap:12px;justify-content:flex-end">
             <button class="btn btn-secondary" onclick="closeMsgModal()">Chiudi</button>
             <button class="btn ${state.copied?'btn-green':'btn-primary'}" onclick="copyMessage()">
@@ -891,11 +1047,9 @@ function renderMsgModal(app) {
 }
 
 function closeMsgModal() {
-  // Clear draft for this supplier (order completed)
   const supId = state.selSup ? state.selSup.id : null;
-  if (supId) {
-    if (db) { db.ref(`drafts/${supId}`).remove(); }
-    else { delete state.allDrafts[supId]; localStorage.setItem('gm_drafts', JSON.stringify(state.allDrafts)); }
+  if (supId && confirm("Ordine inviato?\n\nOK = azzera le quantità ordinate\nAnnulla = conservale per dopo")) {
+    clearDraft(supId);
   }
   state.msgModal = null; state.selSup = null; state.tab = 'dash'; state.draft = {}; state.draftNote = ''; render();
 }
@@ -930,23 +1084,23 @@ function renderModal(app) {
 
   if (m.type === 'supplier') {
     title = isEdit ? 'Modifica Fornitore' : 'Nuovo Fornitore';
-    const shopChips = state.shops.map(sh => `<span class="chip ${(m.data.shopIds||[]).includes(sh.id)?'active':''}" onclick="toggleModalShop('${sh.id}')">🍦 ${sh.name}</span>`).join('');
+    const shopChips = state.shops.map(sh => `<span class="chip ${(m.data.shopIds||[]).includes(sh.id)?'active':''}" onclick="toggleModalShop('${sh.id}')">🍦 ${esc(sh.name)}</span>`).join('');
     body = `
-      <div class="field"><label class="label">Nome</label><input class="input" id="m_name" value="${m.data.name||''}" placeholder="es. Molinari..."></div>
-      <div class="field"><label class="label">Note ordine</label><input class="input" id="m_note" value="${m.data.note||''}" placeholder="es. Ordine entro lunedì..."></div>
+      <div class="field"><label class="label">Nome</label><input class="input" id="m_name" value="${esc(m.data.name||'')}" placeholder="es. Molinari..."></div>
+      <div class="field"><label class="label">Note ordine</label><input class="input" id="m_note" value="${esc(m.data.note||'')}" placeholder="es. Ordine entro lunedì..."></div>
       <div class="field"><label class="label">Negozi</label><div id="m_shops">${shopChips}</div></div>`;
   } else if (m.type === 'product') {
     title = isEdit ? 'Modifica Prodotto' : 'Nuovo Prodotto';
-    const supOpts = state.suppliers.map(s => `<option value="${s.id}" ${s.id===m.data.sid?'selected':''}>${s.name}</option>`).join('');
-    const shopChips = state.shops.map(sh => `<span class="chip ${(m.data.shops||[]).includes(sh.id)?'active':''}" onclick="toggleModalProdShop('${sh.id}')">🍦 ${sh.name}</span>`).join('');
+    const supOpts = state.suppliers.map(s => `<option value="${s.id}" ${s.id===m.data.sid?'selected':''}>${esc(s.name)}</option>`).join('');
+    const shopChips = state.shops.map(sh => `<span class="chip ${(m.data.shops||[]).includes(sh.id)?'active':''}" onclick="toggleModalProdShop('${sh.id}')">🍦 ${esc(sh.name)}</span>`).join('');
     body = `
-      <div class="field"><label class="label">Nome Prodotto</label><input class="input" id="m_name" value="${m.data.name||''}" placeholder="es. Caffè espresso..."></div>
+      <div class="field"><label class="label">Nome Prodotto</label><input class="input" id="m_name" value="${esc(m.data.name||'')}" placeholder="es. Caffè espresso..."></div>
       <div class="field"><label class="label">Fornitore</label><select class="input" id="m_sid">${supOpts}</select></div>
-      <div class="field"><label class="label">Unità</label><input class="input" id="m_unit" value="${m.data.u||''}" placeholder="es. kg, litri..."></div>
+      <div class="field"><label class="label">Unità</label><input class="input" id="m_unit" value="${esc(m.data.u||'')}" placeholder="es. kg, litri..."></div>
       <div class="field"><label class="label">Negozi</label><div id="m_shops">${shopChips}</div></div>`;
   } else if (m.type === 'shop') {
     title = isEdit ? 'Modifica Negozio' : 'Nuovo Negozio';
-    body = `<div class="field"><label class="label">Nome</label><input class="input" id="m_name" value="${m.data.name||''}" placeholder="es. Gelateria Centro..."></div>`;
+    body = `<div class="field"><label class="label">Nome</label><input class="input" id="m_name" value="${esc(m.data.name||'')}" placeholder="es. Gelateria Centro..."></div>`;
   }
 
   const div = document.createElement('div');
@@ -967,13 +1121,23 @@ function renderModal(app) {
   app.appendChild(div.firstElementChild);
 }
 
+function syncModalFields() {
+  const d = state.modal.data;
+  const g = id => document.getElementById(id);
+  if (g('m_name')) d.name = g('m_name').value;
+  if (g('m_note')) d.note = g('m_note').value;
+  if (g('m_unit')) d.u = g('m_unit').value;
+  if (g('m_sid')) d.sid = g('m_sid').value;
+}
 function toggleModalShop(id) {
+  syncModalFields();
   const arr = state.modal.data.shopIds || [];
   if (arr.includes(id)) state.modal.data.shopIds = arr.filter(x => x !== id);
   else state.modal.data.shopIds = [...arr, id];
   render();
 }
 function toggleModalProdShop(id) {
+  syncModalFields();
   const arr = state.modal.data.shops || [];
   if (arr.includes(id)) state.modal.data.shops = arr.filter(x => x !== id);
   else state.modal.data.shops = [...arr, id];
@@ -1015,28 +1179,31 @@ function saveModal() {
     }
   }
 
-  saveConfig();
+  saveConfig({ supplier: 'sups', product: 'prods', shop: 'shops' }[m.type]);
   closeModal();
 }
 
-function delProduct(id) { if (!confirm('Eliminare questo prodotto?')) return; state.products = state.products.filter(p => p.id !== id); saveConfig(); render(); }
-function delSupplier(id) { if (!confirm('Eliminare questo fornitore e tutti i suoi prodotti?')) return; state.suppliers = state.suppliers.filter(s => s.id !== id); state.products = state.products.filter(p => p.sid !== id); saveConfig(); render(); }
-function delShop(id) { if (state.shops.length <= 1) return; if (!confirm('Eliminare questo negozio?')) return; state.shops = state.shops.filter(s => s.id !== id); saveConfig(); render(); }
+function delProduct(id) { if (!confirm('Eliminare questo prodotto?')) return; state.products = state.products.filter(p => p.id !== id); saveConfig('prods'); render(); }
+function delSupplier(id) { if (!confirm('Eliminare questo fornitore e tutti i suoi prodotti?')) return; state.suppliers = state.suppliers.filter(s => s.id !== id); state.products = state.products.filter(p => p.sid !== id); saveConfig('sups', 'prods'); render(); }
+function delShop(id) { if (state.shops.length <= 1) return; if (!confirm('Eliminare questo negozio?')) return; state.shops = state.shops.filter(s => s.id !== id); saveConfig('shops'); render(); }
 
 // ── Schermata PIN ──
+// Il PIN viene verificato da Firebase (accesso con password): senza PIN
+// corretto il database non consegna nessun dato.
+function hidePinScreen() {
+  document.querySelectorAll('.pin-screen').forEach(s => s.remove());
+}
+
 function showPinScreen() {
+  if (document.querySelector('.pin-screen')) return;
   let entered = "";
+  let busy = false;
   const screen = document.createElement('div');
   screen.className = 'pin-screen';
   screen.innerHTML = `
     <h1>GelaMagazzino</h1>
     <div class="pin-sub">Inserisci il PIN per accedere</div>
-    <div class="pin-display">
-      <div class="pin-dot"></div>
-      <div class="pin-dot"></div>
-      <div class="pin-dot"></div>
-      <div class="pin-dot"></div>
-    </div>
+    <div class="pin-display">${'<div class="pin-dot"></div>'.repeat(PIN_LENGTH)}</div>
     <div class="pin-pad">
       <button class="pin-key" data-k="1">1</button>
       <button class="pin-key" data-k="2">2</button>
@@ -1064,38 +1231,43 @@ function showPinScreen() {
     });
   }
 
+  function fail(text, wait) {
+    screen.classList.add('error');
+    msg.textContent = text;
+    setTimeout(() => {
+      entered = "";
+      busy = false;
+      updateDots();
+      screen.classList.remove('error');
+      msg.textContent = '';
+    }, wait);
+  }
+
   function tryUnlock() {
-    if (entered === APP_PIN) {
-      try { localStorage.setItem('gm_pin_ok', '1'); } catch(e) {}
-      screen.style.transition = 'opacity .3s';
-      screen.style.opacity = '0';
-      setTimeout(() => {
-        screen.remove();
-        startApp();
-      }, 300);
-    } else {
-      screen.classList.add('error');
-      msg.textContent = 'PIN errato';
-      setTimeout(() => {
-        entered = "";
-        updateDots();
-        screen.classList.remove('error');
-        msg.textContent = '';
-      }, 600);
-    }
+    busy = true;
+    msg.textContent = 'Verifica…';
+    firebase.auth().signInWithEmailAndPassword(AUTH_EMAIL, entered)
+      .catch(err => {
+        const c = (err && err.code) || '';
+        if (c === 'auth/too-many-requests') fail('Troppi tentativi. Riprova tra qualche minuto.', 4000);
+        else if (c === 'auth/network-request-failed') fail('Nessuna connessione a internet.', 2500);
+        else if (['auth/wrong-password', 'auth/invalid-credential', 'auth/invalid-login-credentials', 'auth/user-not-found'].includes(c)) fail('PIN errato', 900);
+        else { console.error("Errore accesso:", err); fail('Accesso non riuscito (' + c + ')', 4000); }
+      });
+    // se il PIN è giusto, onAuthStateChanged chiude questa schermata
   }
 
   screen.querySelectorAll('.pin-key').forEach(btn => {
     btn.addEventListener('click', () => {
       const k = btn.dataset.k;
-      if (!k) return;
+      if (!k || busy) return;
       if (k === 'del') {
         entered = entered.slice(0, -1);
         updateDots();
-      } else if (entered.length < 4) {
+      } else if (entered.length < PIN_LENGTH) {
         entered += k;
         updateDots();
-        if (entered.length === 4) {
+        if (entered.length === PIN_LENGTH) {
           setTimeout(tryUnlock, 150);
         }
       }
@@ -1103,19 +1275,14 @@ function showPinScreen() {
   });
 }
 
-function startApp() {
-  initFirebase();
-  if (!state.mode) render();
+function lockApp() {
+  if (!confirm('Uscire? Per rientrare servirà il PIN.')) return;
+  firebase.auth().signOut();
 }
 
 // ── Init ──
-let pinOk = false;
-try { pinOk = localStorage.getItem('gm_pin_ok') === '1'; } catch(e) {}
-if (pinOk) {
-  startApp();
-} else {
-  showPinScreen();
-}
+try { localStorage.removeItem('gm_pin_ok'); } catch(e) {}
+initFirebase();
 </script>
 </body>
 </html>
